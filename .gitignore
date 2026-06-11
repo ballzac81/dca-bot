@@ -1,0 +1,18 @@
+# Secrets — never commit these
+.env
+user_data/config.json
+
+# Database
+data/
+
+# Freqtrade runtime files
+user_data/logs/
+user_data/tradesv3.sqlite
+user_data/backtest_results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+user_data/tradesv3.sqlite*
