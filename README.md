@@ -38,7 +38,7 @@ The screenshot service has no external port — it is only reachable from inside
 ### 2. Clone and prepare
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/dca-bot.git dca-bot
+git clone https://github.com/ballzac81/dca-bot.git dca-bot
 cd dca-bot
 mkdir -p user_data/strategies user_data/logs data
 cp config.json user_data/config.json
