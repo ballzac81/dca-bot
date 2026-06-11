@@ -241,7 +241,7 @@ Shows total buys, total invested, average and max multipliers, and a full buy hi
 
 Add all pairs to `pair_whitelist` in `user_data/config.json`:
 ```json
-"pair_whitelist": ["BTC/USDT", "SOL/USDT", "SOL/USDT"]
+"pair_whitelist": ["BTC/USDT", "SOL/USDT"]
 ```
 
 Create a separate saved TradingView chart and alert for each coin. Each alert sends a different pair in the webhook body — the bot automatically loads the correct chart URL for that pair using the matching `TV_CHART_URL_XXX` variable in `.env`.
