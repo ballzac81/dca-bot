@@ -60,6 +60,22 @@ API_TIMEOUT         = int(os.environ.get("API_TIMEOUT", "15"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# -- Startup validation -------------------------------------------------------
+def _validate_config():
+    """Fail fast if required environment variables are missing."""
+    required = {
+        "SECRET_TOKEN":      SECRET_TOKEN,
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "FREQTRADE_PASS":    FREQTRADE_PASS,
+    }
+    missing = [k for k, v in required.items() if not v or v.startswith("CHANGE_THIS")]
+    if missing:
+        logger.error("Missing required environment variables: %s", ", ".join(missing))
+        logger.error("Check your .env file and restart the container.")
+        raise SystemExit(1)
+
+_validate_config()
+
 # -- Flask --------------------------------------------------------------------
 app = Flask(__name__)
 db.init_db()
@@ -133,75 +149,90 @@ def crop_right(screenshot_b64: str, keep_pct: float = 0.50) -> str:
 
 
 def get_chart_screenshot(pair: str = "") -> str | None:
-    """Call the internal screenshot service. Returns base64 PNG or None."""
-    try:
-        chart_url = get_chart_url(pair)
-        params = {"url": chart_url} if chart_url else {}
-        resp = requests.get(f"{SCREENSHOT_URL}/screenshot", params=params, timeout=60)
-        if resp.status_code == 401:
-            logger.error("TradingView session expired")
-            telegram(
-                "DCA Bot: TradingView session expired\n"
-                "Update TV_COOKIES_JSON in your .env file and restart."
-            )
-            return None
-        resp.raise_for_status()
-        screenshot = resp.json().get("screenshot")
-        return screenshot
-    except Exception as e:
-        logger.error("Screenshot service failed: %s", e)
-        return None
+    """Call the internal screenshot service. Returns base64 PNG or None.
+    Retries up to API_RETRIES times on transient failures."""
+    chart_url = get_chart_url(pair)
+    params = {"url": chart_url} if chart_url else {}
+    last_error = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            resp = requests.get(f"{SCREENSHOT_URL}/screenshot", params=params, timeout=60)
+            if resp.status_code == 401:
+                logger.error("TradingView session expired")
+                telegram(
+                    "DCA Bot: TradingView session expired\n"
+                    "Update TV_COOKIES_JSON in your .env file and restart."
+                )
+                return None
+            resp.raise_for_status()
+            screenshot = resp.json().get("screenshot")
+            return screenshot
+        except Exception as e:
+            last_error = e
+            logger.warning("Screenshot attempt %d/%d failed: %s", attempt, API_RETRIES, e)
+            if attempt < API_RETRIES:
+                time.sleep(API_RETRY_DELAY)
+    logger.error("Screenshot service failed after %d attempts: %s", API_RETRIES, last_error)
+    return None
 
 
 def extract_multiplier(screenshot_b64: str) -> float:
-    """Send chart screenshot to Claude Vision and extract the multiplier value."""
+    """Send chart screenshot to Claude Vision and extract the multiplier value.
+    Retries up to API_RETRIES times on transient API failures."""
     if not ANTHROPIC_API_KEY:
         logger.warning("ANTHROPIC_API_KEY not set — defaulting multiplier to 1.0")
         return 1.0
 
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=20,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": screenshot_b64,
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    last_error = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=20,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": screenshot_b64,
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "This is a TradingView chart with the DCAS Calculator indicator. "
+                                "Green triangle buy signals appear on the chart, each with a small blue text label directly below or beside it showing a multiplier like x2.5 or x4.02. "
+                                "There may also be a white popup box on the right side showing 'DCA vs DCAS' stats — ignore that box completely. "
+                                "Find the green triangle furthest to the RIGHT edge of the chart (the most recent signal). "
+                                "Read the blue multiplier label (e.g. x4.02) next to that rightmost green triangle. "
+                                "Return ONLY the number — no x, no text, just the digits (e.g. 4.02). "
+                                "If you cannot find any label, return 1.0."
+                            )
                         }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is a TradingView chart with the DCAS Calculator indicator. "
-                            "Green triangle buy signals appear on the chart, each with a small blue text label directly below or beside it showing a multiplier like x2.5 or x4.02. "
-                            "There may also be a white popup box on the right side showing 'DCA vs DCAS' stats — ignore that box completely. "
-                            "Find the green triangle furthest to the RIGHT edge of the chart (the most recent signal). "
-                            "Read the blue multiplier label (e.g. x4.02) next to that rightmost green triangle. "
-                            "Return ONLY the number — no x, no text, just the digits (e.g. 4.02). "
-                            "If you cannot find any label, return 1.0."
-                        )
-                    }
-                ]
-            }]
-        )
-        raw = response.content[0].text.strip()
-        match = re.search(r'\d+\.?\d*', raw)
-        if not match:
-            logger.warning("Vision returned no number: %r — defaulting to 1.0", raw)
-            return 1.0
-        multiplier = float(match.group())
-        logger.info("Vision extracted multiplier: %s", multiplier)
-        return multiplier
+                    ]
+                }]
+            )
+            raw = response.content[0].text.strip()
+            match = re.search(r'\d+\.?\d*', raw)
+            if not match:
+                logger.warning("Vision returned no number: %r — defaulting to 1.0", raw)
+                return 1.0
+            multiplier = float(match.group())
+            logger.info("Vision extracted multiplier: %s", multiplier)
+            return multiplier
 
-    except Exception as e:
-        logger.error("Vision API failed: %s — defaulting to 1.0", e)
-        return 1.0
+        except Exception as e:
+            last_error = e
+            logger.warning("Vision API attempt %d/%d failed: %s", attempt, API_RETRIES, e)
+            if attempt < API_RETRIES:
+                time.sleep(API_RETRY_DELAY)
+
+    logger.error("Vision API failed after %d attempts: %s — defaulting to 1.0", API_RETRIES, last_error)
+    return 1.0
 
 # -- Trade execution ----------------------------------------------------------
 def execute_buy(pair: str, multiplier: float = 1.0) -> bool:

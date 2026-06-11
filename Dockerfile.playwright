@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
+FROM mcr.microsoft.com/playwright/python:latest
 
 WORKDIR /app
 
@@ -8,5 +8,8 @@ RUN pip install --no-cache-dir -r requirements.playwright.txt
 COPY screenshot_service.py .
 
 EXPOSE 5001
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')" || exit 1
 
 CMD ["python", "screenshot_service.py"]

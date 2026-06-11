@@ -265,8 +265,36 @@ The multiplier is read directly from the DCAS Calculator label on the chart by C
 - `.env` and `user_data/config.json` are gitignored and never committed
 - Screenshot service has no external ports — accessible only from inside the Docker network
 - Exchange API: no withdrawal permissions, IP whitelist to your server where possible
+- GitHub repo: safe to be public because all secrets are gitignored — `.env` and `user_data/config.json` are never committed
 - TradingView 2FA stays on — cookies are used to authenticate, not your password
 - TradingView cookies are stored only in your local `.env` file — never share them
+- Startup validation: the bot exits immediately on launch if any required env var is missing, so misconfigured deployments fail loudly rather than silently
+
+### Securing the Freqtrade port
+
+The Freqtrade API is exposed on port 8201. If your server is internet-facing, restrict access to it:
+
+**Option 1 — Firewall (simplest):** Block port 8201 at your firewall or cloud security group. Allow only your local network or VPN.
+
+**Option 2 — Tailscale (recommended for remote access):** Install [Tailscale](https://tailscale.com) on your server and on any device you want to access it from. Bind Freqtrade to your Tailscale IP by updating `listen_ip_address` in `user_data/config.json`, then block port 8201 from the public internet. You can then access the Freqtrade UI from anywhere on your Tailscale network at `http://TAILSCALE_IP:8201`.
+
+**Option 3 — Nginx reverse proxy:** Put Nginx in front of Freqtrade with basic auth or client certificate authentication.
+
+### Token rotation
+
+`SECRET_TOKEN` is passed in the TradingView webhook URL, which means it may appear in TradingView's alert logs. Rotate it periodically:
+
+1. Generate a new token: `openssl rand -hex 24`
+2. Update `SECRET_TOKEN` in your `.env` and restart: `docker compose restart dca-bot`
+3. Update the webhook URL in all your TradingView alerts
+
+### TradingView cookie refresh
+
+TradingView session cookies typically expire every few months. When the bot logs `TradingView session expired` or screenshots start returning blank pages, re-export your cookies following step 7 of the setup, update `TV_COOKIES_JSON` in your `.env`, and restart:
+
+```bash
+docker compose restart screenshot-service
+```
 
 ## ⚠️ Disclaimer
 
