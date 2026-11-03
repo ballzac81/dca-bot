@@ -21,24 +21,6 @@ services:
       --config /freqtrade/user_data/config.json
       --strategy DCAStrategy
 
-  freqtrade-usd:
-    image: freqtradeorg/freqtrade:stable
-    container_name: DCA_freqtrade_usd
-    restart: unless-stopped
-    profiles: ["usd"]
-    ports:
-      - "8202:8080"              # USD Freqtrade UI — JUP/USD and other USD pairs
-    volumes:
-      - ./user_data:/freqtrade/user_data
-    networks:
-      - internal
-    command: >
-      trade
-      --logfile /freqtrade/user_data/logs/freqtrade-usd.log
-      --db-url sqlite:////freqtrade/user_data/tradesv3-usd.sqlite
-      --config /freqtrade/user_data/config-usd.json
-      --strategy DCAStrategy
-
   dca-bot:
     build:
       context: .
@@ -52,7 +34,6 @@ services:
     env_file: .env
     environment:
       - FREQTRADE_API=http://freqtrade:8080/api/v1
-      - FREQTRADE_API_USD=http://freqtrade-usd:8080/api/v1
       - SCREENSHOT_URL=http://screenshot-service:5001
       - DB_PATH=/data/dca_bot.db
     networks:
