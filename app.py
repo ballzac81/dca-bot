@@ -250,7 +250,7 @@ def execute_buy(pair: str, multiplier: float = 1.0) -> bool:
         multiplier_str = f" (x{multiplier} multiplier)" if multiplier != 1.0 else ""
         logger.info("BUY %s: stake=%.2f%s", pair, stake, multiplier_str)
 
-        result    = _ft_request("POST", "/forcebuy", json={"pair": pair, "stake_amount": stake})
+        result    = _ft_request("POST", "/forcebuy", json={"pair": pair, "stakeamount": stake})
         trade_id  = result.get("trade_id") or result.get("id", "?")
         open_rate = result.get("open_rate")
 
