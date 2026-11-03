@@ -2,14 +2,14 @@
 
 Automated DCA (Dollar Cost Average) trading bot for the DCAS Calculator TradingView indicator.
 
-When an alert fires, the bot screenshots your TradingView chart, uses Claude Vision AI to read the multiplier value printed on the chart, then executes a buy via Freqtrade on your chosen exchange. Stake size is automatically scaled: `BASE_STAKE × multiplier`.
+When an alert fires, the bot screenshots your TradingView chart, uses Grok vision to read the multiplier value printed on the chart, then executes a buy via Freqtrade on your chosen exchange. Stake size is automatically scaled: `BASE_STAKE × multiplier`.
 
 ## How it works
 
 1. DCAS Calculator fires a signal on TradingView
 2. TradingView sends a webhook POST to `/dca-buy`
 3. Bot calls the internal screenshot service to capture your chart
-4. Screenshot is sent to Claude Vision API — it reads the blue multiplier label (e.g. x4.02) next to the latest green triangle signal
+4. Screenshot is sent to the Grok vision API — it reads the blue multiplier label (e.g. x4.02) next to the latest green triangle signal
 5. Stake is calculated: `BASE_STAKE × multiplier` (e.g. 100 × 4.02 = 402)
 6. Freqtrade executes a `forcebuy` on your exchange for that stake amount
 7. Buy is logged to SQLite and a Telegram notification is sent
@@ -32,7 +32,7 @@ The screenshot service has no external port — it is only reachable from inside
 - Docker and Docker Compose (any Linux, macOS, or Windows host)
 - TradingView **paid account** (Essential or higher) — required for webhook alerts and to access the DCAS Calculator, which is a paid invite-only indicator
 - Account on a supported exchange with API key (no withdrawal permission needed)
-- Anthropic API key (Claude Vision — cheap, ~$0.01 per screenshot)
+- xAI API key (Grok vision — reads the multiplier off the chart screenshot)
 - Telegram bot (optional, for buy notifications)
 
 ### 2. Clone and prepare
@@ -88,7 +88,8 @@ Copy `.env.example` to `.env` and fill in all `CHANGE_THIS` values:
 ```env
 SECRET_TOKEN=        # run: openssl rand -hex 24
 FREQTRADE_PASS=      # must match api_server.password in config.json
-ANTHROPIC_API_KEY=   # from https://console.anthropic.com
+XAI_API_KEY=         # from https://console.x.ai
+XAI_MODEL=grok-4.7   # vision model; override if you want a different Grok model
 BASE_STAKE=100       # amount per buy signal, in your stake currency (multiplied by the chart multiplier)
 
 # Per-pair chart URLs — the bot picks the right chart based on the alert pair.
@@ -256,7 +257,7 @@ The stake per buy is `BASE_STAKE × multiplier`. Example with `BASE_STAKE=100`:
 | ×2.5       | 250   |
 | ×4.02      | 402   |
 
-The multiplier is read directly from the DCAS Calculator label on the chart by Claude Vision.
+The multiplier is read directly from the DCAS Calculator label on the chart by Grok vision.
 
 ## Security
 

@@ -4,7 +4,7 @@
 Flow:
   1. TradingView alert fires -> POST /dca-buy
   2. Bot calls screenshot-service to capture the TradingView chart
-  3. Screenshot sent to Claude Vision API -> multiplier extracted
+  3. Screenshot sent to Grok vision API -> multiplier extracted
   4. Buy executed: BASE_STAKE * multiplier via Freqtrade -> Kraken
 
 Endpoints:
@@ -19,7 +19,7 @@ import re
 import time
 import base64
 import requests
-import anthropic
+from openai import OpenAI
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string
 from flask_limiter import Limiter
@@ -40,7 +40,8 @@ FREQTRADE_USER      = os.environ.get("FREQTRADE_USER", "admin")
 FREQTRADE_PASS      = os.environ.get("FREQTRADE_PASS", "")
 TG_TOKEN            = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT             = os.environ.get("TELEGRAM_CHAT_ID", "")
-ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+XAI_API_KEY         = os.environ.get("XAI_API_KEY", "")
+XAI_MODEL           = os.environ.get("XAI_MODEL", "grok-4.7")
 SCREENSHOT_URL      = os.environ.get("SCREENSHOT_URL", "http://screenshot-service:5001")
 
 # Per-pair chart URLs — e.g. TV_CHART_URL_BTC=https://... TV_CHART_URL_SOL=https://...
@@ -65,7 +66,7 @@ def _validate_config():
     """Fail fast if required environment variables are missing."""
     required = {
         "SECRET_TOKEN":      SECRET_TOKEN,
-        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "XAI_API_KEY":       XAI_API_KEY,
         "FREQTRADE_PASS":    FREQTRADE_PASS,
     }
     missing = [k for k, v in required.items() if not v or v.startswith("CHANGE_THIS")]
@@ -177,29 +178,28 @@ def get_chart_screenshot(pair: str = "") -> str | None:
 
 
 def extract_multiplier(screenshot_b64: str) -> float:
-    """Send chart screenshot to Claude Vision and extract the multiplier value.
+    """Send chart screenshot to Grok vision and extract the multiplier value.
     Retries up to API_RETRIES times on transient API failures."""
-    if not ANTHROPIC_API_KEY:
-        logger.warning("ANTHROPIC_API_KEY not set — defaulting multiplier to 1.0")
+    if not XAI_API_KEY:
+        logger.warning("XAI_API_KEY not set — defaulting multiplier to 1.0")
         return 1.0
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
     last_error = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+            response = client.chat.completions.create(
+                model=XAI_MODEL,
                 max_tokens=20,
                 messages=[{
                     "role": "user",
                     "content": [
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": screenshot_b64,
-                            }
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{screenshot_b64}",
+                                "detail": "high",
+                            },
                         },
                         {
                             "type": "text",
@@ -211,12 +211,12 @@ def extract_multiplier(screenshot_b64: str) -> float:
                                 "Read the blue multiplier label (e.g. x4.02) next to that rightmost green triangle. "
                                 "Return ONLY the number — no x, no text, just the digits (e.g. 4.02). "
                                 "If you cannot find any label, return 1.0."
-                            )
-                        }
-                    ]
-                }]
+                            ),
+                        },
+                    ],
+                }],
             )
-            raw = response.content[0].text.strip()
+            raw = (response.choices[0].message.content or "").strip()
             match = re.search(r'\d+\.?\d*', raw)
             if not match:
                 logger.warning("Vision returned no number: %r — defaulting to 1.0", raw)
@@ -233,6 +233,7 @@ def extract_multiplier(screenshot_b64: str) -> float:
 
     logger.error("Vision API failed after %d attempts: %s — defaulting to 1.0", API_RETRIES, last_error)
     return 1.0
+
 
 # -- Trade execution ----------------------------------------------------------
 def execute_buy(pair: str, multiplier: float = 1.0) -> bool:
@@ -296,7 +297,7 @@ def dca_buy():
     Auth: ?token=YOUR_SECRET_TOKEN or X-Token header.
 
     The bot automatically screenshots your TradingView chart and extracts
-    the multiplier using Claude Vision. No multiplier needed in the payload.
+    the multiplier using Grok vision. No multiplier needed in the payload.
     """
     data = request.get_json(silent=True) or {}
     pair = data.get("pair", TRADING_PAIR)
