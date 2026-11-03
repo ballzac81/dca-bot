@@ -51,6 +51,7 @@ def get_chart_url(pair: str) -> str:
     return os.environ.get(key) or os.environ.get("TV_CHART_URL", "")
 
 BASE_STAKE          = float(os.environ.get("BASE_STAKE", "150"))
+BASE_STAKE_CURRENCY = os.environ.get("BASE_STAKE_CURRENCY", "AUD").upper()
 MIN_STAKE           = float(os.environ.get("MIN_STAKE", "15.0"))
 
 API_RETRIES         = int(os.environ.get("API_RETRIES", "3"))
@@ -236,19 +237,52 @@ def extract_multiplier(screenshot_b64: str) -> float:
 
 
 # -- Trade execution ----------------------------------------------------------
-def execute_buy(pair: str, multiplier: float = 1.0) -> bool:
-    try:
-        stake = round(BASE_STAKE * multiplier, 2)
+def audusd_rate() -> float:
+    """USD paid for 1 AUD on Kraken's AUD/USD market."""
+    resp = requests.get(
+        "https://api.kraken.com/0/public/Ticker",
+        params={"pair": "AUDUSD"},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("error"):
+        raise RuntimeError("AUDUSD ticker: " + ", ".join(body["error"]))
+    rate = float(body["result"]["AUDUSD"]["c"][0])
+    if rate <= 0:
+        raise RuntimeError(f"bad AUDUSD rate {rate}")
+    return rate
 
-        if stake < MIN_STAKE:
-            msg = f"DCA BUY skipped for {pair} — stake {stake:.2f} below minimum {MIN_STAKE:.0f}"
+
+def execute_buy(pair: str, multiplier: float = 1.0) -> tuple[bool, float, float | None]:
+    """Returns (ok, stake_in_quote_currency, audusd_rate or None)."""
+    notion = round(BASE_STAKE * multiplier, 2)
+    quote = pair.split("/")[1].upper()
+    stake = notion
+    rate = None
+    try:
+        if notion < MIN_STAKE:
+            msg = f"DCA BUY skipped for {pair} — stake {notion:.2f} {BASE_STAKE_CURRENCY} below minimum {MIN_STAKE:.0f}"
             logger.warning(msg)
             telegram(msg)
-            db.log_buy(pair, stake, multiplier, status="skipped")
-            return False
+            db.log_buy(pair, notion, multiplier, status="skipped")
+            return False, notion, None
+
+        if BASE_STAKE_CURRENCY == "AUD" and quote == "USD":
+            rate = audusd_rate()
+            stake = round(notion * rate, 2)
+            logger.info(
+                "AUD stake %.2f -> %.2f USD at AUDUSD %.5f",
+                notion, stake, rate,
+            )
+        elif BASE_STAKE_CURRENCY != quote:
+            raise RuntimeError(
+                f"BASE_STAKE_CURRENCY is {BASE_STAKE_CURRENCY} but {pair} trades in {quote}"
+            )
 
         multiplier_str = f" (x{multiplier} multiplier)" if multiplier != 1.0 else ""
-        logger.info("BUY %s: stake=%.2f%s", pair, stake, multiplier_str)
+        aud_str = f" ({notion:.2f} AUD)" if rate is not None else ""
+        logger.info("BUY %s: stake=%.2f %s%s%s", pair, stake, quote, aud_str, multiplier_str)
 
         result    = _ft_request("POST", "/forcebuy", json={"pair": pair, "stakeamount": stake})
         trade_id  = result.get("trade_id") or result.get("id", "?")
@@ -259,18 +293,18 @@ def execute_buy(pair: str, multiplier: float = 1.0) -> bool:
         telegram(
             f"DCA BUY executed\n"
             f"Pair: {pair}\n"
-            f"Stake: {stake:.2f}{multiplier_str}\n"
+            f"Stake: {stake:.2f} {quote}{aud_str}{multiplier_str}\n"
             f"Rate: {open_rate}\n"
             f"Trade ID: {trade_id}"
         )
-        logger.info("BUY success: %s trade_id=%s stake=%.2f", pair, trade_id, stake)
-        return True
+        logger.info("BUY success: %s trade_id=%s stake=%.2f %s", pair, trade_id, stake, quote)
+        return True, stake, rate
 
     except Exception as e:
         logger.error("BUY failed for %s: %s", pair, e)
-        db.log_buy(pair, stake if 'stake' in dir() else 0, multiplier, status="failed")
+        db.log_buy(pair, stake, multiplier, status="failed")
         telegram(f"DCA BUY FAILED: {pair} — check logs\n{e}")
-        return False
+        return False, stake, rate
 
 # -- Auth decorator -----------------------------------------------------------
 def require_token(f):
@@ -317,11 +351,17 @@ def dca_buy():
         logger.warning("Screenshot unavailable — buying with multiplier 1.0")
         telegram(f"DCA BUY {pair}: screenshot failed, using base stake {BASE_STAKE}")
 
-    success = execute_buy(pair, multiplier)
-    return jsonify({
-        "status":     "trade_executed" if success else "trade_failed",
-        "multiplier": multiplier,
-    }), 200
+    success, stake, rate = execute_buy(pair, multiplier)
+    body = {
+        "status":         "trade_executed" if success else "trade_failed",
+        "multiplier":     multiplier,
+        "stake":          stake,
+        "stake_currency": pair.split("/")[1].upper(),
+    }
+    if rate is not None:
+        body["stake_aud"] = round(BASE_STAKE * multiplier, 2)
+        body["audusd"] = rate
+    return jsonify(body), 200
 
 
 # -- Status / health ----------------------------------------------------------

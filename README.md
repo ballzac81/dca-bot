@@ -10,7 +10,7 @@ When an alert fires, the bot screenshots your TradingView chart, uses Grok visio
 2. TradingView sends a webhook POST to `/dca-buy`
 3. Bot calls the internal screenshot service to capture your chart
 4. Screenshot is sent to the Grok vision API — it reads the blue multiplier label (e.g. x4.02) next to the latest green triangle signal
-5. Stake is calculated: `BASE_STAKE × multiplier` (e.g. 100 × 4.02 = 402)
+5. Stake is calculated: `BASE_STAKE × multiplier`. With `BASE_STAKE_CURRENCY=AUD` that AUD amount is converted at the Kraken AUD/USD rate and the order is placed in USD.
 6. Freqtrade executes a `forcebuy` on your exchange for that stake amount
 7. Buy is logged to SQLite and a Telegram notification is sent
 8. Dashboard at `:8200/dashboard` shows all buy history
@@ -90,7 +90,8 @@ SECRET_TOKEN=        # run: openssl rand -hex 24
 FREQTRADE_PASS=      # must match api_server.password in config.json
 XAI_API_KEY=         # from https://console.x.ai
 XAI_MODEL=grok-4.7   # vision model; override if you want a different Grok model
-BASE_STAKE=100       # amount per buy signal, in your stake currency (multiplied by the chart multiplier)
+BASE_STAKE=100              # amount per buy signal, before the multiplier
+BASE_STAKE_CURRENCY=AUD     # converted to USD at the live AUD/USD rate. The Kraken order is still USD.
 
 # Per-pair chart URLs — the bot picks the right chart based on the alert pair.
 # TV_CHART_URL is the fallback used if no per-pair URL matches.
@@ -249,7 +250,7 @@ Create a separate saved TradingView chart and alert for each coin. Each alert se
 
 ## Position sizing
 
-The stake per buy is `BASE_STAKE × multiplier`. Example with `BASE_STAKE=100`:
+The stake per buy is `BASE_STAKE × multiplier`, in `BASE_STAKE_CURRENCY`. Example with `BASE_STAKE=100` and `BASE_STAKE_CURRENCY=AUD`: the bot sizes 100, 250, or 402 AUD, then sends the USD equivalent to Freqtrade. Kraken still needs a USD balance. No AUD is sold on the exchange.
 
 | Multiplier | Stake |
 |------------|-------|
