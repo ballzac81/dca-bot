@@ -13,11 +13,14 @@ Endpoints:
   GET  /health    health check
 """
 
+import hashlib
+import hmac
 import logging
 import os
 import re
 import time
 import base64
+import urllib.parse
 import requests
 from openai import OpenAI
 from functools import wraps
@@ -42,6 +45,11 @@ TG_TOKEN            = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT             = os.environ.get("TELEGRAM_CHAT_ID", "")
 XAI_API_KEY         = os.environ.get("XAI_API_KEY", "")
 XAI_MODEL           = os.environ.get("XAI_MODEL", "grok-4.7")
+FREQTRADE_API_USD   = os.environ.get("FREQTRADE_API_USD", "http://freqtrade-usd:8080/api/v1")
+KRAKEN_API_KEY      = os.environ.get("KRAKEN_API_KEY", "")
+KRAKEN_API_SECRET   = os.environ.get("KRAKEN_API_SECRET", "")
+CONVERT_AUD_TO_USD  = os.environ.get("CONVERT_AUD_TO_USD", "true").lower() in ("1", "true", "yes")
+USD_STAKE_BUFFER    = 0.99  # leave room for the AUD/USD taker fee after a live conversion
 SCREENSHOT_URL      = os.environ.get("SCREENSHOT_URL", "http://screenshot-service:5001")
 
 # Per-pair chart URLs — e.g. TV_CHART_URL_BTC=https://... TV_CHART_URL_SOL=https://...
@@ -102,8 +110,9 @@ def telegram(msg: str):
         logger.warning("Telegram failed: %s", e)
 
 # -- Freqtrade API ------------------------------------------------------------
-def _ft_request(method: str, endpoint: str, **kwargs) -> dict:
-    url = f"{FREQTRADE_API}/{endpoint.lstrip('/')}"
+def _ft_request(method: str, endpoint: str, api: str | None = None, **kwargs) -> dict:
+    base = (api or FREQTRADE_API).rstrip("/")
+    url = f"{base}/{endpoint.lstrip('/')}"
     auth = (FREQTRADE_USER, FREQTRADE_PASS)
     last_error = None
     for attempt in range(1, API_RETRIES + 1):
@@ -236,41 +245,145 @@ def extract_multiplier(screenshot_b64: str) -> float:
 
 
 # -- Trade execution ----------------------------------------------------------
-def execute_buy(pair: str, multiplier: float = 1.0) -> bool:
-    try:
-        stake = round(BASE_STAKE * multiplier, 2)
+def quote_currency(pair: str) -> str:
+    return pair.split("/")[1].upper()
 
-        if stake < MIN_STAKE:
-            msg = f"DCA BUY skipped for {pair} — stake {stake:.2f} below minimum {MIN_STAKE:.0f}"
+
+def ft_api_for(pair: str) -> str:
+    if quote_currency(pair) == "USD":
+        return FREQTRADE_API_USD
+    return FREQTRADE_API
+
+
+def audusd_rate() -> float:
+    """USD received for 1 AUD, from the Kraken AUD/USD spot market."""
+    resp = requests.get(
+        "https://api.kraken.com/0/public/Ticker",
+        params={"pair": "AUDUSD"},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("error"):
+        raise RuntimeError("AUDUSD ticker: " + ", ".join(body["error"]))
+    last = float(body["result"]["AUDUSD"]["c"][0])
+    if last <= 0:
+        raise RuntimeError(f"AUDUSD rate was {last}")
+    return last
+
+
+def usd_bot_is_dry_run() -> bool:
+    """True unless the USD bot explicitly reports dry_run false.
+    Unknown means do not sell real AUD."""
+    try:
+        cfg = _ft_request("GET", "/show_config", api=FREQTRADE_API_USD)
+    except Exception as e:
+        logger.warning("Could not read USD bot config (%s) — will not convert real AUD", e)
+        return True
+    return bool(cfg.get("dry_run", True))
+
+
+def kraken_market_sell_aud(volume_aud: float) -> str:
+    """Sell AUD for USD on the native AUD/USD market. Returns the Kraken txid."""
+    if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
+        raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set to convert AUD to USD")
+    if volume_aud < 7:
+        raise RuntimeError(f"Kraken AUD/USD minimum is 7 AUD (got {volume_aud:.2f})")
+
+    urlpath = "/0/private/AddOrder"
+    payload = {
+        "nonce": str(int(time.time() * 1000)),
+        "pair": "AUDUSD",
+        "type": "sell",
+        "ordertype": "market",
+        "volume": f"{volume_aud:.2f}",
+    }
+    postdata = urllib.parse.urlencode(payload)
+    message = urlpath.encode() + hashlib.sha256((payload["nonce"] + postdata).encode()).digest()
+    signature = base64.b64encode(
+        hmac.new(base64.b64decode(KRAKEN_API_SECRET), message, hashlib.sha512).digest()
+    ).decode()
+    resp = requests.post(
+        "https://api.kraken.com" + urlpath,
+        data=payload,
+        headers={"API-Key": KRAKEN_API_KEY, "API-Sign": signature},
+        timeout=API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("error"):
+        raise RuntimeError("Kraken AddOrder: " + ", ".join(body["error"]))
+    txids = body.get("result", {}).get("txid") or []
+    return txids[0] if txids else "?"
+
+
+def execute_buy(pair: str, multiplier: float = 1.0) -> tuple[bool, float, str]:
+    """Buy `pair`. Stake is BASE_STAKE * multiplier in AUD.
+    USD pairs are sent to the USD Freqtrade bot, sized at the AUD/USD rate.
+    Returns (success, stake_in_pair_quote, quote)."""
+    quote = quote_currency(pair)
+    stake_aud = round(BASE_STAKE * multiplier, 2)
+    stake = stake_aud
+    try:
+        if stake_aud < MIN_STAKE:
+            msg = f"DCA BUY skipped for {pair} — stake {stake_aud:.2f} AUD below minimum {MIN_STAKE:.0f}"
             logger.warning(msg)
             telegram(msg)
-            db.log_buy(pair, stake, multiplier, status="skipped")
-            return False
+            db.log_buy(pair, stake_aud, multiplier, status="skipped")
+            return False, stake_aud, "AUD"
+
+        api = ft_api_for(pair)
+        if quote == "USD":
+            rate = audusd_rate()
+            dry = usd_bot_is_dry_run()
+            if dry or not CONVERT_AUD_TO_USD:
+                stake = round(stake_aud * rate, 2)
+                if dry:
+                    logger.info(
+                        "USD bot is dry-run — not selling real AUD. Stake %.2f USD (%.2f AUD at %.5f)",
+                        stake, stake_aud, rate,
+                    )
+                else:
+                    logger.info(
+                        "CONVERT_AUD_TO_USD is off — staking %.2f USD from the USD balance (%.2f AUD at %.5f)",
+                        stake, stake_aud, rate,
+                    )
+            else:
+                txid = kraken_market_sell_aud(stake_aud)
+                stake = round(stake_aud * rate * USD_STAKE_BUFFER, 2)
+                logger.info(
+                    "Sold %.2f AUD for USD on Kraken (txid %s). Staking %.2f USD",
+                    stake_aud, txid, stake,
+                )
+                time.sleep(2)
 
         multiplier_str = f" (x{multiplier} multiplier)" if multiplier != 1.0 else ""
-        logger.info("BUY %s: stake=%.2f%s", pair, stake, multiplier_str)
+        logger.info("BUY %s: stake=%.2f %s%s", pair, stake, quote, multiplier_str)
 
-        result    = _ft_request("POST", "/forcebuy", json={"pair": pair, "stake_amount": stake})
+        result    = _ft_request("POST", "/forcebuy", api=api, json={"pair": pair, "stake_amount": stake})
         trade_id  = result.get("trade_id") or result.get("id", "?")
         open_rate = result.get("open_rate")
 
-        db.log_buy(pair, stake, multiplier, trade_id=trade_id, open_rate=open_rate, status="executed")
+        db.log_buy(pair, stake_aud, multiplier, trade_id=trade_id, open_rate=open_rate, status="executed")
 
         telegram(
             f"DCA BUY executed\n"
             f"Pair: {pair}\n"
-            f"Stake: {stake:.2f}{multiplier_str}\n"
+            f"Stake: {stake:.2f} {quote}"
+            + (f" ({stake_aud:.2f} AUD)" if quote != "AUD" else "")
+            + f"{multiplier_str}\n"
             f"Rate: {open_rate}\n"
             f"Trade ID: {trade_id}"
         )
-        logger.info("BUY success: %s trade_id=%s stake=%.2f", pair, trade_id, stake)
-        return True
+        logger.info("BUY success: %s trade_id=%s stake=%.2f %s", pair, trade_id, stake, quote)
+        return True, stake, quote
 
     except Exception as e:
         logger.error("BUY failed for %s: %s", pair, e)
-        db.log_buy(pair, stake if 'stake' in dir() else 0, multiplier, status="failed")
+        db.log_buy(pair, stake_aud, multiplier, status="failed")
         telegram(f"DCA BUY FAILED: {pair} — check logs\n{e}")
-        return False
+        return False, stake, quote
+
 
 # -- Auth decorator -----------------------------------------------------------
 def require_token(f):
@@ -317,10 +430,12 @@ def dca_buy():
         logger.warning("Screenshot unavailable — buying with multiplier 1.0")
         telegram(f"DCA BUY {pair}: screenshot failed, using base stake {BASE_STAKE}")
 
-    success = execute_buy(pair, multiplier)
+    success, stake, currency = execute_buy(pair, multiplier)
     return jsonify({
-        "status":     "trade_executed" if success else "trade_failed",
-        "multiplier": multiplier,
+        "status":         "trade_executed" if success else "trade_failed",
+        "multiplier":     multiplier,
+        "stake":          stake,
+        "stake_currency": currency,
     }), 200
 
 

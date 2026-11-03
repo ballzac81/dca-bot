@@ -229,6 +229,34 @@ The bot runs in dry-run mode by default (no real trades). When you are satisfied
 1. Set `"dry_run": false` in `user_data/config.json`
 2. Restart freqtrade: `docker compose restart freqtrade`
 
+### USD pairs (JUP/USD)
+
+Freqtrade allows one stake currency per instance. `BTC/AUD` stays on the AUD bot. `JUP/USD` runs on a second bot with its own database. Kraken's website `JUP/AUD` price is a synthetic pair and is not a spot market, so it cannot be whitelisted.
+
+On the Unraid host:
+
+```bash
+cp user_data/config.json user_data/config-usd.json
+```
+
+Edit `user_data/config-usd.json`:
+
+- `"stake_currency": "USD"`
+- `"pair_whitelist": ["JUP/USD"]`
+- `"bot_name": "IADSS-DCA-Bot-USD"`
+- `"dry_run_wallet": 10000` (fake USD, only used while dry-run is on)
+- `api_server.password` must still match `FREQTRADE_PASS`
+
+Leave `JUP/AUD` off the AUD whitelist. Then:
+
+```bash
+docker compose --profile usd up -d
+```
+
+The USD UI is on port `8202`. A `JUP/USD` webhook is sized from `BASE_STAKE` in AUD and converted at the Kraken AUD/USD rate, so a 100 AUD signal buys about 70 USD of JUP while dry-run is on. No real AUD is sold.
+
+When you set `"dry_run": false` in `config-usd.json` and restart that container, the next USD buy sells that many AUD on the real `AUD/USD` market, then buys the coin. Put the same Kraken key in `.env` as `KRAKEN_API_KEY` and `KRAKEN_API_SECRET`. Set `CONVERT_AUD_TO_USD=false` if the USD bot should spend USD you already hold instead.
+
 ## Dashboard
 
 Open in your browser:
