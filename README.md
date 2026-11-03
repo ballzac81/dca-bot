@@ -192,28 +192,28 @@ Create one alert per coin on its chart:
 4. Set **Trigger** to **Once Per Bar Close** (on the timeframe the indicator uses)
 5. Under **Notifications**, enable **Webhook URL** and enter:
 ```
-http://YOUR_SERVER_IP:8200/dca-buy?token=YOUR_SECRET_TOKEN
+https://dcas.ballzac.uk/dca-buy
 ```
 6. Set the **Message** body to:
 ```json
-{"pair": "BTC/USDT"}
+{"pair": "JUP/USD", "token": "YOUR_SECRET_TOKEN"}
 ```
-Replace `BTC/USDT` with the actual pair for that chart, using the exact format your exchange uses (e.g. `BTC/AUD`, `BTC/USDT`, `SOL/USDT`).
+Replace `JUP/USD` with the pair for that chart. The token stays in the message, not the URL, so it is not written into Cloudflare request logs.
 
 7. Save the alert
 
 Repeat for each additional coin with its corresponding pair in the message body.
 
-> **Auth:** The token goes in the URL as `?token=...`, not in the message body. The message body must be valid JSON containing only the `pair` key.
+> **Auth:** Buys are rejected unless the token matches and the request comes from TradingView's published webhook addresses (or from localhost, for testing). The same pair cannot be bought again for 4 minutes, which drops TradingView retries.
 
 ### 10. Test
 
 Fire a manual test to confirm the full pipeline works end-to-end:
 
 ```bash
-curl -s -X POST "http://localhost:8200/dca-buy?token=YOUR_SECRET_TOKEN" \
+curl -s -X POST "http://localhost:8200/dca-buy" \
   -H "Content-Type: application/json" \
-  -d '{"pair": "BTC/USDT"}'
+  -d '{"pair": "JUP/USD", "token": "YOUR_SECRET_TOKEN"}'
 ```
 
 Replace `BTC/USDT` with one of your configured pairs. Check the logs:

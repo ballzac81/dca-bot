@@ -13,9 +13,12 @@ Endpoints:
   GET  /health    health check
 """
 
+import hmac
+import ipaddress
 import logging
 import os
 import re
+import threading
 import time
 import base64
 import requests
@@ -34,6 +37,14 @@ def valid_pair(pair: str) -> bool:
 
 # -- Config -------------------------------------------------------------------
 SECRET_TOKEN        = os.environ.get("SECRET_TOKEN", "")
+# Query-string tokens show up in Cloudflare and proxy logs. Dashboard still uses them.
+ALLOW_QUERY_TOKEN   = os.environ.get("ALLOW_QUERY_TOKEN", "false").lower() in ("1", "true", "yes")
+ENFORCE_WEBHOOK_IPS = os.environ.get("ENFORCE_WEBHOOK_IPS", "true").lower() in ("1", "true", "yes")
+BUY_COOLDOWN_SECONDS = int(os.environ.get("BUY_COOLDOWN_SECONDS", "240"))
+_DEFAULT_TV_IPS = "52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7"
+WEBHOOK_ALLOW_IPS = {
+    ip.strip() for ip in os.environ.get("WEBHOOK_ALLOW_IPS", _DEFAULT_TV_IPS).split(",") if ip.strip()
+}
 TRADING_PAIR        = os.environ.get("TRADING_PAIR", "BTC/AUD")
 FREQTRADE_API       = os.environ.get("FREQTRADE_API", "http://freqtrade:8080/api/v1")
 FREQTRADE_USER      = os.environ.get("FREQTRADE_USER", "admin")
@@ -307,41 +318,114 @@ def execute_buy(pair: str, multiplier: float = 1.0) -> tuple[bool, float, float 
         return False, stake, rate
 
 # -- Auth decorator -----------------------------------------------------------
-def require_token(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.args.get("token") or request.headers.get("X-Token")
-        if SECRET_TOKEN and token != SECRET_TOKEN:
-            return jsonify({"error": "unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
+_last_buy_at = {}
+_buy_lock = threading.Lock()
+
+def _token_ok(got: str) -> bool:
+    if not SECRET_TOKEN or not got or len(got) != len(SECRET_TOKEN):
+        return False
+    return hmac.compare_digest(got, SECRET_TOKEN)
+
+def _supplied_token(allow_query: bool) -> str:
+    data = request.get_json(silent=True) if request.method == "POST" else None
+    if isinstance(data, dict) and data.get("token"):
+        return str(data.get("token"))
+    header = request.headers.get("X-Token")
+    if header:
+        return header
+    if allow_query:
+        return request.args.get("token") or ""
+    return ""
+
+def require_token(f=None, *, allow_query=True):
+    def decorator(func):
+        @wraps(func)
+        def decorated(*args, **kwargs):
+            if not _token_ok(_supplied_token(allow_query)):
+                return jsonify({"error": "unauthorized"}), 401
+            return func(*args, **kwargs)
+        return decorated
+    if f is None:
+        return decorator
+    return decorator(f)
+
+def _buy_source_allowed() -> bool:
+    """Local curl with no Cloudflare header is allowed.
+    Tunnel traffic must come from TradingView's published webhook IPs."""
+    if not ENFORCE_WEBHOOK_IPS:
+        return True
+    remote = request.remote_addr or ""
+    try:
+        peer = ipaddress.ip_address(remote)
+    except ValueError:
+        return False
+    cf = (request.headers.get("CF-Connecting-IP") or "").split(",")[0].strip()
+    if peer.is_loopback and not cf:
+        return True
+    if cf and (peer.is_private or peer.is_loopback):
+        return cf in WEBHOOK_ALLOW_IPS
+    return remote in WEBHOOK_ALLOW_IPS
+
+def _reserve_cooldown(pair: str) -> float | None:
+    """Return seconds remaining if this pair was bought too recently."""
+    if BUY_COOLDOWN_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with _buy_lock:
+        last = _last_buy_at.get(pair)
+        if last is not None and now - last < BUY_COOLDOWN_SECONDS:
+            return BUY_COOLDOWN_SECONDS - (now - last)
+        _last_buy_at[pair] = now
+    return None
 
 # -- Endpoints ----------------------------------------------------------------
 
 @app.route("/dca-buy", methods=["POST"])
 @limiter.limit("10 per minute")
-@require_token
+@require_token(allow_query=False)
 def dca_buy():
     """
     DCA buy signal from DCAS Calculator.
 
     TradingView webhook body:
-        {"pair": "BTC/AUD"}
+        {"pair": "JUP/USD", "token": "YOUR_SECRET_TOKEN"}
 
-    Auth: ?token=YOUR_SECRET_TOKEN or X-Token header.
-
-    The bot automatically screenshots your TradingView chart and extracts
-    the multiplier using Grok vision. No multiplier needed in the payload.
+    The token is read from the JSON body or the X-Token header, not the URL.
+    Requests that arrive through Cloudflare must come from TradingView's
+    webhook addresses. A direct localhost test is still allowed.
     """
+    if not _buy_source_allowed():
+        logger.warning("Rejected webhook from %s", request.headers.get("CF-Connecting-IP") or request.remote_addr)
+        return jsonify({"error": "forbidden"}), 403
+
     data = request.get_json(silent=True) or {}
     pair = data.get("pair", TRADING_PAIR)
 
     if not valid_pair(pair):
         return jsonify({"error": "invalid pair"}), 400
 
-    logger.info("DCA BUY signal received: %s", pair)
+    wait = _reserve_cooldown(pair)
+    if wait is not None:
+        logger.warning("Cooldown active for %s, %.0fs left", pair, wait)
+        return jsonify({"error": "cooldown", "pair": pair, "retry_after": round(wait)}), 429
 
-    # Get multiplier from chart via screenshot + vision
+    remote = request.remote_addr or ""
+    try:
+        local_test = ipaddress.ip_address(remote).is_loopback and not request.headers.get("CF-Connecting-IP")
+    except ValueError:
+        local_test = False
+
+    # TradingView gives up after 3 seconds. Screenshot + vision takes longer,
+    # so public webhooks are processed after the response. Local curl still waits.
+    if local_test:
+        return jsonify(_process_buy(pair)), 200
+
+    threading.Thread(target=_process_buy, args=(pair,), daemon=True).start()
+    return jsonify({"status": "accepted", "pair": pair}), 200
+
+
+def _process_buy(pair: str) -> dict:
+    logger.info("DCA BUY signal received: %s", pair)
     multiplier = 1.0
     screenshot = get_chart_screenshot(pair)
     if screenshot:
@@ -361,7 +445,7 @@ def dca_buy():
     if rate is not None:
         body["stake_aud"] = round(BASE_STAKE * multiplier, 2)
         body["audusd"] = rate
-    return jsonify(body), 200
+    return body
 
 
 # -- Status / health ----------------------------------------------------------
